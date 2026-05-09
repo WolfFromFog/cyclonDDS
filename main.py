@@ -1,15 +1,14 @@
 import sys
 import threading
 import math
-import time
 import pygame
 from cyclonedds.domain import DomainParticipant
 from cyclonedds.pub import DataWriter
 from cyclonedds.sub import DataReader
 from cyclonedds.topic import Topic
 from cyclonedds.core import Qos, Policy
-from cyclonedds.util import duration
 from turtle_dds import TurtlePose
+from cyclonedds.util import duration
 from ros_math import def_angl, def_distance
 
 # ----------------------------- Конфигурация -----------------------------
@@ -24,18 +23,17 @@ TURTLE_COLORS = [
     (255, 255, 0),  # жёлтый
     (255, 0, 255),  # пурпурный
 ]
-
-LINEAR_SPEED = 80.0
-ANGULAR_SPEED = 2.0
-FOLLOW_DISTANCE_THRESH = 10
-
+LINEAR_SPEED = 80.0          # пикселей в секунду
+ANGULAR_SPEED = 2.0          # радиан в секунду (макс. скорость поворота)
+FOLLOW_DISTANCE_THRESH = 10  # пикселей – при меньшем расстоянии остановка
 DDS_TOPIC_NAME = "TurtlePose"
 DDS_DOMAIN_ID = 0
+Kp_ANGULAR = 3.0             # Коэффициент усиления П-регулятора угла
 
 # ----------------------------- Класс черепахи -----------------------------
 class Turtle:
-    def __init__(self, tid, x, y, theta, is_controlled, target_id,
-                 participant, topic, qos):
+    def __init__(self, tid, x, y, theta, is_controlled=False, target_id=None,
+                 participant=None, topic=None, qos=None):
         self.id = tid
         self.x = x
         self.y = y
@@ -44,35 +42,32 @@ class Turtle:
         self.target_id = target_id
         self.target_pose = None
         self.lock = threading.Lock()
+        self._stop_event = threading.Event()
 
-        # Публикатор
-        self.writer = DataWriter(participant, topic, qos=qos)
+        self.topic = topic
+        self.writer = DataWriter(participant, self.topic, qos=qos)
 
-        # Подписчик (только если есть цель)
         self.reader = None
         if target_id is not None:
-            self.reader = DataReader(participant, topic, qos=qos)
+            self.reader = DataReader(participant, self.topic, qos=qos)
             self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
             self.reader_thread.start()
 
+    def stop(self):
+        """Безопасное завершение потока чтения."""
+        self._stop_event.set()
+        if self.reader_thread.is_alive():
+            self.reader_thread.join(timeout=1.0)
+
     def _reader_loop(self):
-        while True:
-            samples = self.reader.take()
-            time.sleep(0.01)
+        while not self._stop_event.is_set():
+            # timeout предотвращает блокировку потока и снижает нагрузку на CPU
+            samples = self.reader.take(timeout=duration(seconds=0.05)) or []
             for sample in samples:
-                # В разных версиях cyclonedds sample может быть объектом сообщения
-                # или иметь поле data. Пробуем оба варианта.
-                if hasattr(sample, 'data'):
-                    pose = sample.data
-                else:
-                    pose = sample
+                pose = sample.data
                 if pose.id == self.target_id:
                     with self.lock:
                         self.target_pose = (pose.x, pose.y, pose.theta)
-                    # Отладка: как только получили позицию – печатаем
-                    print(f"Turtle {self.id} got target {self.target_id} at ({pose.x:.1f}, {pose.y:.1f})")
-            # Небольшая задержка, чтобы не грузить процессор
-            threading.Event().wait(0.01)
 
     def publish_pose(self):
         msg = TurtlePose(id=self.id, x=self.x, y=self.y, theta=self.theta)
@@ -93,11 +88,7 @@ class Turtle:
         self.x += linear * math.cos(self.theta) * dt
         self.y += linear * math.sin(self.theta) * dt
         self.theta += angular * dt
-        self.theta %= 2 * math.pi
-
-        # Ограничение, чтобы не выходила за окно
-        self.x = max(0, min(WINDOW_WIDTH, self.x))
-        self.y = max(0, min(WINDOW_HEIGHT, self.y))
+        self.theta = (self.theta + math.pi) % (2.0 * math.pi) - math.pi
 
     def update_follower(self, dt):
         with self.lock:
@@ -111,30 +102,28 @@ class Turtle:
             angular = 0.0
         else:
             delta_angle = def_angl(tx, ty, self.x, self.y, self.theta)
-            Kp = 3.0  # подбирается экспериментально
-            angular = max(-ANGULAR_SPEED, min(ANGULAR_SPEED, Kp*delta_angle))
+            # П-регулятор с ограничением максимальной угловой скорости
+            angular = max(-ANGULAR_SPEED, min(ANGULAR_SPEED, Kp_ANGULAR * delta_angle))
             linear = LINEAR_SPEED
 
         self.x += linear * math.cos(self.theta) * dt
         self.y += linear * math.sin(self.theta) * dt
         self.theta += angular * dt
-        self.theta %= 2 * math.pi
+        self.theta = (self.theta + math.pi) % (2.0 * math.pi) - math.pi
 
-        # Ограничение, чтобы не выходила за окно
-        self.x = max(0, min(WINDOW_WIDTH, self.x))
-        self.y = max(0, min(WINDOW_HEIGHT, self.y))
-
-    def draw(self, screen):
+    def draw(self, screen, font):
         color = TURTLE_COLORS[self.id % len(TURTLE_COLORS)]
         center = (int(self.x), int(self.y))
         pygame.draw.circle(screen, color, center, TURTLE_RADIUS)
-        pygame.draw.circle(screen, (0,0,0), center, TURTLE_RADIUS, 2)
+        pygame.draw.circle(screen, (0, 0, 0), center, TURTLE_RADIUS, 2)
 
         head_len = TURTLE_RADIUS
         head_x = self.x + head_len * math.cos(self.theta)
         head_y = self.y + head_len * math.sin(self.theta)
-        pygame.draw.line(screen, (0,0,0), center, (int(head_x), int(head_y)), 3)
+        pygame.draw.line(screen, (0, 0, 0), center, (int(head_x), int(head_y)), 3)
 
+        text = font.render(f"T{self.id}", True, (0, 0, 0))
+        screen.blit(text, (self.x - 10, self.y - 20))
 
 # ----------------------------- Основная функция -----------------------------
 def main():
@@ -142,26 +131,26 @@ def main():
     screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
     pygame.display.set_caption("Turtle DDS Demo")
     clock = pygame.time.Clock()
+    font = pygame.font.SysFont(None, 24)
 
-    # DDS участник и общий топик (один на всех)
     participant = DomainParticipant(DDS_DOMAIN_ID)
-    # Используем стандартный QoS – он гарантированно работает
-    qos = Qos()
+    qos = Qos(
+        Policy.Reliability.Reliable(max_blocking_time=duration(seconds=0.1)),
+        Policy.Durability.TransientLocal
+    )
+    # Topic создаётся один раз на уровне участника (best practice DDS)
     topic = Topic(participant, DDS_TOPIC_NAME, TurtlePose, qos=qos)
 
     turtles = []
-
-    # Управляемая черепаха (id=0)
     turtle0 = Turtle(0, WINDOW_WIDTH//2, WINDOW_HEIGHT//2, 0.0,
                      is_controlled=True, target_id=None,
                      participant=participant, topic=topic, qos=qos)
     turtles.append(turtle0)
 
-    # Ведомые черепахи: id = 1,2,3...
     num_followers = 3
     start_x = WINDOW_WIDTH//2 - 60
     start_y = WINDOW_HEIGHT//2
-    for i in range(1, num_followers+1):
+    for i in range(1, num_followers + 1):
         follower = Turtle(i,
                           start_x - i*40, start_y + i*30,
                           0.0,
@@ -171,46 +160,42 @@ def main():
         turtles.append(follower)
 
     running = True
-    while running:
-        dt = clock.tick(60) / 1000.0
-        if dt > 0.05:
-            dt = 0.05
+    try:
+        while running:
+            dt = clock.tick(60) / 1000.0
+            if dt > 0.05:
+                dt = 0.05
 
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                running = False
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    running = False
 
-        keys = pygame.key.get_pressed()
+            keys = pygame.key.get_pressed()
 
-        # Обновление позиций
+            for t in turtles:
+                if t.is_controlled:
+                    t.update_controlled(keys, dt)
+                else:
+                    t.update_follower(dt)
+
+            for t in turtles:
+                t.publish_pose()
+
+            screen.fill(BACKGROUND_COLOR)
+            for t in turtles:
+                t.draw(screen, font)
+
+            pygame.display.flip()
+    except KeyboardInterrupt:
+        pass
+    finally:
         for t in turtles:
-            if t.is_controlled:
-                t.update_controlled(keys, dt)
-            else:
-                t.update_follower(dt)
-
-        # Публикация всех состояний
-        for t in turtles:
-            t.publish_pose()
-
-        # Отрисовка
-        screen.fill(BACKGROUND_COLOR)
-        for t in turtles:
-            t.draw(screen)
-
-        font = pygame.font.SysFont(None, 24)
-        for t in turtles:
-            text = font.render(f"T{t.id}", True, (0,0,0))
-            screen.blit(text, (t.x-10, t.y-20))
-
-        pygame.display.flip()
-
-    pygame.quit()
-    participant.close()
-    sys.exit()
-
+            t.stop()
+        pygame.quit()
+        participant.close()
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()
