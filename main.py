@@ -77,14 +77,16 @@ class Turtle:
                     else:
                         pose = item
                     if pose.id == self.target_id:
-                        print(f"T{self.id} got target at ({pose.x:.1f}, {pose.y:.1f})")
+                        #print(f"T{self.id} got target at ({pose.x:.1f}, {pose.y:.1f})")
                         with self.lock:
                             self.target_pose = (pose.x, pose.y, pose.theta)
+            time.sleep(0.000001)
 
     def publish_pose(self):
         msg = TurtlePose(id=self.id, x=self.x, y=self.y, theta=self.theta)
         self.writer.write(msg)
-        print(f"T{self.id} published: ({self.x:.1f}, {self.y:.1f})")
+        #print(f"T{self.id} published: ({self.x:.1f}, {self.y:.1f})")
+        time.sleep(0.000001)
 
     def update_controlled(self, keys, dt):
         linear = 0.0
@@ -156,12 +158,9 @@ def main():
 
     participant = DomainParticipant(DDS_DOMAIN_ID)
     # Для надёжности используем стандартный QoS (если с Reliability/TransientLocal будут проблемы)
-    qos = Qos()   # Работает гарантированно
+    #qos = Qos()   # Работает гарантированно
     # Альтернативно, можно вернуть настройки с Reliable, если всё работает:
-    # qos = Qos(
-    #     Policy.Reliability.Reliable(max_blocking_time=duration(seconds=0.1)),
-    #     Policy.Durability.TransientLocal
-    # )
+    qos = Qos(Policy.Reliability.Reliable(max_blocking_time=duration(seconds=0.1)),Policy.Durability.TransientLocal)
     topic = Topic(participant, DDS_TOPIC_NAME, TurtlePose, qos=qos)
 
     turtles = []
@@ -173,10 +172,10 @@ def main():
     turtles.append(turtle0)
 
     # Ведомые черепахи
-    num_followers = 3
+    num_followers = 5
     start_x = WINDOW_WIDTH//2 - 60
     start_y = WINDOW_HEIGHT//2
-    time.sleep(0.1)
+    #time.sleep(0.1)
     for i in range(1, num_followers + 1):
         follower = Turtle(i,
                           start_x - i*40, start_y + i*30,
@@ -185,10 +184,11 @@ def main():
                           target_id=i-1,
                           participant=participant, topic=topic, qos=qos)
         turtles.append(follower)
-        time.sleep(0.1)
+        #time.sleep(0.1)
 
     running = True
     try:
+        frame_count = 0
         while running:
             dt = clock.tick(60) / 1000.0
             if dt > 0.05:
@@ -207,7 +207,7 @@ def main():
                     t.update_controlled(keys, dt)
                 else:
                     t.update_follower(dt)
-
+           
             for t in turtles:
                 t.publish_pose()
 
