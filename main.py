@@ -1,14 +1,15 @@
 import sys
 import threading
 import math
+import time
 import pygame
 from cyclonedds.domain import DomainParticipant
 from cyclonedds.pub import DataWriter
 from cyclonedds.sub import DataReader
 from cyclonedds.topic import Topic
 from cyclonedds.core import Qos, Policy
-from turtle_dds import TurtlePose
 from cyclonedds.util import duration
+from turtle_dds import TurtlePose
 from ros_math import def_angl, def_distance
 
 # ----------------------------- Конфигурация -----------------------------
@@ -23,12 +24,12 @@ TURTLE_COLORS = [
     (255, 255, 0),  # жёлтый
     (255, 0, 255),  # пурпурный
 ]
-LINEAR_SPEED = 80.0          # пикселей в секунду
-ANGULAR_SPEED = 2.0          # радиан в секунду (макс. скорость поворота)
-FOLLOW_DISTANCE_THRESH = 10  # пикселей – при меньшем расстоянии остановка
+LINEAR_SPEED = 80.0
+ANGULAR_SPEED = 2.0
+FOLLOW_DISTANCE_THRESH = 10
 DDS_TOPIC_NAME = "TurtlePose"
 DDS_DOMAIN_ID = 0
-Kp_ANGULAR = 3.0             # Коэффициент усиления П-регулятора угла
+Kp_ANGULAR = 3.0
 
 # ----------------------------- Класс черепахи -----------------------------
 class Turtle:
@@ -43,6 +44,7 @@ class Turtle:
         self.target_pose = None
         self.lock = threading.Lock()
         self._stop_event = threading.Event()
+        self.reader_thread = None
 
         self.topic = topic
         self.writer = DataWriter(participant, self.topic, qos=qos)
@@ -56,22 +58,33 @@ class Turtle:
     def stop(self):
         """Безопасное завершение потока чтения."""
         self._stop_event.set()
-        if self.reader_thread.is_alive():
+        if self.reader_thread and self.reader_thread.is_alive():
             self.reader_thread.join(timeout=1.0)
 
     def _reader_loop(self):
         while not self._stop_event.is_set():
-            # timeout предотвращает блокировку потока и снижает нагрузку на CPU
-            samples = self.reader.take(timeout=duration(seconds=0.05)) or []
-            for sample in samples:
-                pose = sample.data
-                if pose.id == self.target_id:
-                    with self.lock:
-                        self.target_pose = (pose.x, pose.y, pose.theta)
+            try:
+                samples = self.reader.take()
+            except Exception as e:
+                print(f"Reader error: {e}")
+                break
+            if self._stop_event.is_set():
+                break
+            if samples:
+                for item in samples:
+                    if hasattr(item, 'data'):
+                        pose = item.data
+                    else:
+                        pose = item
+                    if pose.id == self.target_id:
+                        print(f"T{self.id} got target at ({pose.x:.1f}, {pose.y:.1f})")
+                        with self.lock:
+                            self.target_pose = (pose.x, pose.y, pose.theta)
 
     def publish_pose(self):
         msg = TurtlePose(id=self.id, x=self.x, y=self.y, theta=self.theta)
         self.writer.write(msg)
+        print(f"T{self.id} published: ({self.x:.1f}, {self.y:.1f})")
 
     def update_controlled(self, keys, dt):
         linear = 0.0
@@ -90,6 +103,10 @@ class Turtle:
         self.theta += angular * dt
         self.theta = (self.theta + math.pi) % (2.0 * math.pi) - math.pi
 
+        # Ограничение по границам окна
+        self.x = max(0, min(WINDOW_WIDTH, self.x))
+        self.y = max(0, min(WINDOW_HEIGHT, self.y))
+
     def update_follower(self, dt):
         with self.lock:
             if self.target_pose is None:
@@ -102,7 +119,6 @@ class Turtle:
             angular = 0.0
         else:
             delta_angle = def_angl(tx, ty, self.x, self.y, self.theta)
-            # П-регулятор с ограничением максимальной угловой скорости
             angular = max(-ANGULAR_SPEED, min(ANGULAR_SPEED, Kp_ANGULAR * delta_angle))
             linear = LINEAR_SPEED
 
@@ -110,6 +126,10 @@ class Turtle:
         self.y += linear * math.sin(self.theta) * dt
         self.theta += angular * dt
         self.theta = (self.theta + math.pi) % (2.0 * math.pi) - math.pi
+
+        # Ограничение по границам окна
+        self.x = max(0, min(WINDOW_WIDTH, self.x))
+        self.y = max(0, min(WINDOW_HEIGHT, self.y))
 
     def draw(self, screen, font):
         color = TURTLE_COLORS[self.id % len(TURTLE_COLORS)]
@@ -125,6 +145,7 @@ class Turtle:
         text = font.render(f"T{self.id}", True, (0, 0, 0))
         screen.blit(text, (self.x - 10, self.y - 20))
 
+
 # ----------------------------- Основная функция -----------------------------
 def main():
     pygame.init()
@@ -134,22 +155,28 @@ def main():
     font = pygame.font.SysFont(None, 24)
 
     participant = DomainParticipant(DDS_DOMAIN_ID)
-    qos = Qos(
-        Policy.Reliability.Reliable(max_blocking_time=duration(seconds=0.1)),
-        Policy.Durability.TransientLocal
-    )
-    # Topic создаётся один раз на уровне участника (best practice DDS)
+    # Для надёжности используем стандартный QoS (если с Reliability/TransientLocal будут проблемы)
+    qos = Qos()   # Работает гарантированно
+    # Альтернативно, можно вернуть настройки с Reliable, если всё работает:
+    # qos = Qos(
+    #     Policy.Reliability.Reliable(max_blocking_time=duration(seconds=0.1)),
+    #     Policy.Durability.TransientLocal
+    # )
     topic = Topic(participant, DDS_TOPIC_NAME, TurtlePose, qos=qos)
 
     turtles = []
+
+    # Управляемая черепаха
     turtle0 = Turtle(0, WINDOW_WIDTH//2, WINDOW_HEIGHT//2, 0.0,
                      is_controlled=True, target_id=None,
                      participant=participant, topic=topic, qos=qos)
     turtles.append(turtle0)
 
+    # Ведомые черепахи
     num_followers = 3
     start_x = WINDOW_WIDTH//2 - 60
     start_y = WINDOW_HEIGHT//2
+    time.sleep(0.1)
     for i in range(1, num_followers + 1):
         follower = Turtle(i,
                           start_x - i*40, start_y + i*30,
@@ -158,6 +185,7 @@ def main():
                           target_id=i-1,
                           participant=participant, topic=topic, qos=qos)
         turtles.append(follower)
+        time.sleep(0.1)
 
     running = True
     try:
@@ -196,6 +224,7 @@ def main():
         pygame.quit()
         participant.close()
         sys.exit(0)
+
 
 if __name__ == "__main__":
     main()
