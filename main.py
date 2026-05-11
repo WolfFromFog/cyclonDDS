@@ -1,9 +1,11 @@
-#!/usr/bin/env python3
+#! /usr/bin/env python3
 import sys
 import threading
 import math
 import time
-import pygame
+import select
+import termios
+import tty
 from cyclonedds.domain import DomainParticipant
 from cyclonedds.pub import DataWriter
 from cyclonedds.sub import DataReader
@@ -15,10 +17,10 @@ from ros_math import def_angl, def_distance
 
 # ----------------------------- Конфигурация -----------------------------
 WINDOW_WIDTH = 800
-WINDOW_HEIGHT = 600   # нужны только для ограничения координат
-LINEAR_SPEED = 80.0
-ANGULAR_SPEED = 2.0
-FOLLOW_DISTANCE_THRESH = 10
+WINDOW_HEIGHT = 600
+LINEAR_SPEED = 180.0
+ANGULAR_SPEED = 5.0
+FOLLOW_DISTANCE_THRESH = 30
 DDS_TOPIC_NAME = "TurtlePose"
 DDS_DOMAIN_ID = 0
 Kp_ANGULAR = 3.0
@@ -48,6 +50,7 @@ class Turtle:
             self.reader_thread.start()
 
     def stop(self):
+        """Безопасное завершение потока чтения."""
         self._stop_event.set()
         if self.reader_thread and self.reader_thread.is_alive():
             self.reader_thread.join(timeout=1.0)
@@ -70,23 +73,28 @@ class Turtle:
                     if pose.id == self.target_id:
                         with self.lock:
                             self.target_pose = (pose.x, pose.y, pose.theta)
-            time.sleep(0.000001)
+            time.sleep(0.001)
 
     def publish_pose(self):
         msg = TurtlePose(id=self.id, x=self.x, y=self.y, theta=self.theta)
         self.writer.write(msg)
-        time.sleep(0.000001)
+        time.sleep(0.001)
 
-    def update_controlled(self, keys, dt):
+    def update_controlled(self, keys_pressed, dt):
+        """
+        Обновление позиции управляемой черепахи.
+        keys_pressed - множество нажатых в данный момент клавиш
+        """
         linear = 0.0
         angular = 0.0
-        if keys[pygame.K_w]:
+        
+        if 'w' in keys_pressed:
             linear = LINEAR_SPEED
-        if keys[pygame.K_s]:
+        if 's' in keys_pressed:
             linear = -LINEAR_SPEED
-        if keys[pygame.K_a]:
+        if 'a' in keys_pressed:
             angular = ANGULAR_SPEED
-        if keys[pygame.K_d]:
+        if 'd' in keys_pressed:
             angular = -ANGULAR_SPEED
 
         self.x += linear * math.cos(self.theta) * dt
@@ -94,6 +102,7 @@ class Turtle:
         self.theta += angular * dt
         self.theta = (self.theta + math.pi) % (2.0 * math.pi) - math.pi
 
+        # Ограничение по границам окна
         self.x = max(0, min(WINDOW_WIDTH, self.x))
         self.y = max(0, min(WINDOW_HEIGHT, self.y))
 
@@ -117,18 +126,48 @@ class Turtle:
         self.theta += angular * dt
         self.theta = (self.theta + math.pi) % (2.0 * math.pi) - math.pi
 
+        # Ограничение по границам окна
         self.x = max(0, min(WINDOW_WIDTH, self.x))
         self.y = max(0, min(WINDOW_HEIGHT, self.y))
 
+# ----------------------------- Управление клавиатурой -----------------------------
+class KeyboardHandler:
+    """Обработчик клавиатуры, отслеживающий состояние клавиш."""
+    def __init__(self):
+        self.pressed_keys = set()
+        self.old_settings = None
+    
+    def setup_terminal(self):
+        """Настройка терминала для неблокирующего чтения."""
+        self.old_settings = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
+    
+    def restore_terminal(self):
+        """Восстановление настроек терминала."""
+        if self.old_settings:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
+    
+    def update(self):
+        """Обновление состояния клавиш."""
+        # Сбрасываем состояние клавиш (клавиши отпущены)
+        self.pressed_keys.clear()
+        
+        # Читаем все доступные символы
+        while select.select([sys.stdin], [], [], 0)[0]:
+            char = sys.stdin.read(1)
+            if char:
+                self.pressed_keys.add(char.lower())
+    
+    def is_pressed(self, key):
+        """Проверка, нажата ли клавиша."""
+        return key.lower() in self.pressed_keys
+    
+    def get_active_keys(self):
+        """Получение множества активных клавиш."""
+        return self.pressed_keys.copy()
+
 # ----------------------------- Основная функция -----------------------------
 def main():
-    # Инициализация Pygame (окно нужно для захвата клавиш, но рисовать не будем)
-    pygame.init()
-    # Создаём окно минимального размера, чтобы не мешать визуализатору
-    screen = pygame.display.set_mode((1, 1), pygame.NOFRAME)  # невидимое окно (но всё равно появляется в панели задач)
-    pygame.display.set_caption("Turtle Controller (headless)")
-    clock = pygame.time.Clock()
-
     participant = DomainParticipant(DDS_DOMAIN_ID)
     qos = Qos(Policy.Reliability.Reliable(max_blocking_time=duration(seconds=0.1)),
               Policy.Durability.TransientLocal)
@@ -146,49 +185,77 @@ def main():
     num_followers = 5
     start_x = WINDOW_WIDTH//2 - 60
     start_y = WINDOW_HEIGHT//2
+    
     for i in range(1, num_followers + 1):
-        follower = Turtle(i, start_x - i*40, start_y + i*30, 0.0,
-                          is_controlled=False, target_id=i-1,
+        follower = Turtle(i,
+                          start_x - i*40, start_y + i*30,
+                          0.0,
+                          is_controlled=False,
+                          target_id=i-1,
                           participant=participant, topic=topic, qos=qos)
         turtles.append(follower)
 
+    print("Turtle simulator started!")
+    print("Controls: 'w' - forward, 's' - backward, 'a' - turn left, 'd' - turn right")
+    print("Press 'q' to quit")
+    print("Run turtle_viewer.py in another terminal to see the visualization.")
+    
+    # Инициализация обработчика клавиатуры
+    keyboard = KeyboardHandler()
+    keyboard.setup_terminal()
+    
     running = True
+    last_status = ""
+    
     try:
         while running:
-            dt = clock.tick(60) / 1000.0
-            if dt > 0.05:
-                dt = 0.05
-
-            # Обработка событий Pygame (чтобы можно было закрыть окно)
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    running = False
-                elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                    running = False
-
-            keys = pygame.key.get_pressed()
-
+            dt = 0.016  # ~60 FPS
+            
+            # Обновление состояния клавиш
+            keyboard.update()
+            
+            # Проверка на выход
+            if keyboard.is_pressed('q'):
+                running = False
+                break
+            
+            # Отображение статуса
+            active_keys = keyboard.get_active_keys()
+            if active_keys:
+                key_descriptions = []
+                if 'w' in active_keys: key_descriptions.append("forward")
+                if 's' in active_keys: key_descriptions.append("backward")
+                if 'a' in active_keys: key_descriptions.append("left")
+                if 'd' in active_keys: key_descriptions.append("right")
+                status = f"\rMoving: {', '.join(key_descriptions)}   "
+            else:
+                status = "\rStopped                    "
+            
+            if status != last_status:
+                print(status, end='', flush=True)
+                last_status = status
+            
+            # Обновление всех черепах
             for t in turtles:
                 if t.is_controlled:
-                    t.update_controlled(keys, dt)
+                    t.update_controlled(active_keys, dt)  # Передаем множество активных клавиш
                 else:
                     t.update_follower(dt)
-
+           
+            # Публикация позиций
             for t in turtles:
                 t.publish_pose()
 
-            # Отрисовка отсутствует – вся графика теперь в visualizer.py
-            # (можно было бы обновить экран, но он размером 1x1 и невидим)
-
-            # Небольшая задержка для снижения нагрузки на CPU (по желанию)
-            # time.sleep(0.001)
-
+            time.sleep(dt)
+            
     except KeyboardInterrupt:
-        pass
+        print("\nSimulation stopped by user")
     finally:
+        # Восстановление настроек терминала
+        keyboard.restore_terminal()
+        print("\nShutting down...")
         for t in turtles:
             t.stop()
-        pygame.quit()
         participant.close()
         sys.exit(0)
 
