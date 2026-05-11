@@ -3,8 +3,15 @@ from cyclonedds.idl import IdlStruct
 
 @dataclass
 class TurtlePose(IdlStruct):
-    """Сообщение с позицией черепахи."""
+    """Позиция черепахи."""
     id: int
     x: float
     y: float
     theta: float
+
+@dataclass
+class TurtleCmd(IdlStruct):
+    """Команда управления (линейная и угловая скорость)."""
+    id: int          # идентификатор черепахи, которой предназначена команда
+    linear: float
+    angular: float
